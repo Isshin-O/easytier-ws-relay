@@ -134,6 +134,12 @@ easytier-ws-relay/
 
 修改完配置后按正常方式运行 `wrangler dev` 或部署即可生效。
 
+## 断线检测
+
+服务端通过 Durable Object alarm 定期检查连接，异常断开（断网、休眠等没有发送关闭帧）的设备会被移出，不会残留成幽灵节点。可在 `wrangler.toml` 的 `[vars]` 中调整：
+- `EASYTIER_PING_INTERVAL_MS`: 连接空闲多久后服务端发送 Ping，同时也是检查间隔，默认 `"10000"`
+- `EASYTIER_CONN_TIMEOUT_MS`: 多久没有收到任何数据就判定断线，默认 `"35000"`，应明显大于 Ping 间隔
+
 ## Durable Object 地区配置
 
 Durable Object 默认会根据请求来源自动选择最近的地区部署。如需指定地区，可在 `wrangler.toml` 的 `[vars]` 中配置：

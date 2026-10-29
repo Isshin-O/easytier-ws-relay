@@ -1,6 +1,5 @@
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { getPeerManager } from './peer_manager.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { gzipMaybe, gunzipMaybe, isCompressionAvailable } from './compress.js';
 import { loadProtos } from './protos.js';
@@ -49,42 +48,37 @@ function toLongForProto(value) {
   return value;
 }
 
-const peerCenterStateByGroup = new Map();
 const PEER_CENTER_TTL_MS = Number(process.env.EASYTIER_PEER_CENTER_TTL_MS || 180_000);
 const PEER_CENTER_CLEAN_INTERVAL = Math.max(30_000, Math.min(PEER_CENTER_TTL_MS / 2, 120_000));
-let lastPeerCenterClean = 0;
-function pm() {
-  return getPeerManager();
-}
 
-function getPeerCenterState(groupKey) {
+function getPeerCenterState(pm, groupKey) {
   const k = String(groupKey || '');
-  let s = peerCenterStateByGroup.get(k);
+  let s = pm.peerCenterStateByGroup.get(k);
   if (!s) {
     s = {
       globalPeerMap: new Map(),
       digest: '0',
     };
-    peerCenterStateByGroup.set(k, s);
+    pm.peerCenterStateByGroup.set(k, s);
   }
   const now = Date.now();
-  if (now - lastPeerCenterClean > PEER_CENTER_CLEAN_INTERVAL) {
-    cleanPeerCenterState(now);
+  if (now - pm.lastPeerCenterClean > PEER_CENTER_CLEAN_INTERVAL) {
+    cleanPeerCenterState(pm, now);
   }
   s.lastTouch = Date.now();
   return s;
 }
 
-function cleanPeerCenterState(now = Date.now()) {
-  lastPeerCenterClean = now;
-  for (const [gk, s] of peerCenterStateByGroup.entries()) {
+function cleanPeerCenterState(pm, now = Date.now()) {
+  pm.lastPeerCenterClean = now;
+  for (const [gk, s] of pm.peerCenterStateByGroup.entries()) {
     for (const [pid, info] of s.globalPeerMap.entries()) {
       if (now - (info.lastSeen || 0) > PEER_CENTER_TTL_MS) {
         s.globalPeerMap.delete(pid);
       }
     }
     if (now - (s.lastTouch || 0) > PEER_CENTER_TTL_MS && s.globalPeerMap.size === 0) {
-      peerCenterStateByGroup.delete(gk);
+      pm.peerCenterStateByGroup.delete(gk);
     }
   }
 }
@@ -111,14 +105,10 @@ function calcPeerCenterDigestFromMap(mapObj) {
   return u64.toString();
 }
 
-function buildPeerCenterResponseMap(groupKey, state) {
+// Only peers connected to this server are listed, same as in route sync.
+function buildPeerCenterResponseMap(pm, groupKey, state) {
   const out = {};
-  const set = new Set(pm().listPeerIdsInGroup(groupKey));
-  const infos = pm()._getPeerInfosMap(groupKey, false);
-  if (infos) {
-    for (const pid of infos.keys()) set.add(pid);
-  }
-  for (const peerId of set) {
+  for (const peerId of pm.listPeerIdsInGroup(groupKey)) {
     const key = String(peerId);
     const existing = state.globalPeerMap.get(key);
     out[key] = existing ? { ...existing } : { directPeers: {} };
@@ -265,7 +255,7 @@ export function handleRpcReq(ws, header, payload, types) {
     if ((descriptor.serviceName === 'peer_rpc.PeerCenterRpc' || descriptor.serviceName === 'PeerCenterRpc')
       && (descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
       const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
-      const state = getPeerCenterState(groupKey);
+      const state = getPeerCenterState(ws.peerManager, groupKey);
       if (descriptor.methodIndex === 0) {
         const req = types.ReportPeersRequest.decode(innerReqBody);
         const myPeerId = req.myPeerId;
@@ -279,7 +269,7 @@ export function handleRpcReq(ws, header, payload, types) {
         }
         state.globalPeerMap.set(String(myPeerId), { directPeers, lastSeen: Date.now() });
 
-        const snapshot = buildPeerCenterResponseMap(groupKey, state);
+        const snapshot = buildPeerCenterResponseMap(ws.peerManager, groupKey, state);
         state.digest = calcPeerCenterDigestFromMap(snapshot);
 
         const respBytes = types.ReportPeersResponse.encode({}).finish();
@@ -296,7 +286,7 @@ export function handleRpcReq(ws, header, payload, types) {
           return;
         }
 
-        const snapshot = buildPeerCenterResponseMap(groupKey, state);
+        const snapshot = buildPeerCenterResponseMap(ws.peerManager, groupKey, state);
         state.digest = calcPeerCenterDigestFromMap(snapshot);
         const respBytes = types.GetGlobalPeerMapResponse.encode({
           globalPeerMap: snapshot,
@@ -398,7 +388,7 @@ export function handleRpcResp(ws, header, payload, types) {
         const resp = types.SyncRouteInfoResponse.decode(rpcRespBody);
         const sessionId = resp && resp.sessionId ? resp.sessionId : null;
         if (sessionId && ws && ws.groupKey !== undefined) {
-          pm().onRouteSessionAck(ws.groupKey, header.fromPeerId, sessionId, ws.weAreInitiator);
+          ws.peerManager.onRouteSessionAck(ws.groupKey, header.fromPeerId, sessionId, ws.weAreInitiator);
           console.log(`RpcResp SyncRouteInfoResponse from=${header.fromPeerId} sessionId=${sessionId} acked`);
         }
       } catch (e) {
@@ -422,6 +412,11 @@ export function handleRpcResp(ws, header, payload, types) {
 
 function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
   const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+  const pm = ws.peerManager;
+  if (!ws.peerId || fromPeerId !== ws.peerId) {
+    console.warn(`Ignoring SyncRouteInfo from ${fromPeerId} on socket of peer ${ws.peerId}`);
+    return;
+  }
 
   if (!ws.serverSessionId) {
     ws.serverSessionId = randomU64String();
@@ -430,21 +425,18 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
   if (syncReq && typeof syncReq.isInitiator === 'boolean') {
     ws.weAreInitiator = !syncReq.isInitiator;
   }
-  pm().onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
+  pm.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
-  let hasNewPeers = false;
+  // Only the sender's own info is trusted. Clients also resend whatever is left in their
+  // route table, including peers that already left this server; storing those is what
+  // brought departed peers back as ghosts.
+  let selfInfoChanged = false;
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
-    syncReq.peerInfos.items.forEach(info => {
-      if (info.peerId !== MY_PEER_ID) {
-        const infos = pm()._getPeerInfosMap(groupKey, false);
-        const isNew = !infos || !infos.has(info.peerId);
-        pm().updatePeerInfo(groupKey, info.peerId, info);
-        if (isNew) hasNewPeers = true;
+    for (const info of syncReq.peerInfos.items) {
+      if (info.peerId === fromPeerId && pm.updatePeerInfo(groupKey, fromPeerId, info)) {
+        selfInfoChanged = true;
       }
-      if (info.peerId === MY_PEER_ID) {
-        pm().updatePeerInfo(groupKey, info.peerId, info);
-      }
-    });
+    }
   }
 
   const respPayload = {
@@ -468,15 +460,15 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
 
   // After responding, push our current route info back to the requester (mirrors node behavior).
   try {
-    pm().pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
+    pm.pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
     console.log(`Successfully pushed route update to peer ${fromPeerId}`);
   } catch (e) {
     console.error(`Failed to push route update to peer ${fromPeerId}:`, e);
   }
 
-  if (hasNewPeers) {
+  if (selfInfoChanged) {
     try {
-      pm().broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
+      pm.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: false });
       console.log(`Successfully broadcast route update for group ${groupKey}`);
     } catch (e) {
       console.error(`Failed to broadcast route update for group ${groupKey}:`, e);

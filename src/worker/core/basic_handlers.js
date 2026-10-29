@@ -1,12 +1,8 @@
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { getPeerManager } from './peer_manager.js';
 import { wrapPacket, randomU64String } from './crypto.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
-
-// Record the first registered digest per network name; later mismatched digest will be rejected
-const networkDigestRegistry = new Map();
 
 export function handleHandshake(ws, header, payload, types) {
   try {
@@ -24,6 +20,9 @@ export function handleHandshake(ws, header, payload, types) {
       return;
     }
 
+    const pm = ws.peerManager;
+    // Record the first registered digest per network name; later mismatched digest will be rejected
+    const networkDigestRegistry = pm.networkDigestRegistry;
     const clientNetworkName = req.networkName || '';
     const clientDigest = req.networkSecretDigrest ? Buffer.from(req.networkSecretDigrest) : Buffer.alloc(0);
     const digestHex = clientDigest.toString('hex');
@@ -54,15 +53,20 @@ export function handleHandshake(ws, header, payload, types) {
 
     ws.groupKey = groupKey;
     ws.peerId = req.myPeerId;
-    const pm = getPeerManager();
-    pm.addPeer(req.myPeerId, ws);
-    pm.updatePeerInfo(ws.groupKey, req.myPeerId, {
-      peerId: req.myPeerId,
-      version: 1,
-      lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-      instId: { part1: 0, part2: 0, part3: 0, part4: 0 },
-      networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
+    ws.serializeAttachment?.({
+      ...(ws.deserializeAttachment?.() || {}),
+      peerId: ws.peerId,
+      groupKey: ws.groupKey,
+      domainName: ws.domainName,
     });
+    // The peer's own info arrives with its first SyncRouteInfo; until then it is only
+    // listed in the conn bitmap.
+    const replaced = pm.addPeer(req.myPeerId, ws);
+    if (replaced) {
+      // Same peer reconnected: drop the old socket. Its close event is then a no-op
+      // because removePeer only removes the socket currently registered for the peer.
+      try { replaced.close(1000, 'replaced by new connection'); } catch (_) { }
+    }
     pm.setPublicServerFlag(true);
     ws.crypto = { enabled: false };
 
@@ -79,7 +83,6 @@ export function handleHandshake(ws, header, payload, types) {
     setTimeout(() => {
       try {
         if (ws.readyState === WS_OPEN) {
-          const pm = getPeerManager();
           pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
           pm.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
         }
@@ -101,7 +104,7 @@ export function handlePing(ws, header, payload) {
 
 export function handleForwarding(sourceWs, header, fullMessage, types) {
   const targetPeerId = header.toPeerId;
-  const pm = getPeerManager();
+  const pm = sourceWs.peerManager;
   const targetWs = pm.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
 
   if (targetWs && targetWs.readyState === WS_OPEN) {

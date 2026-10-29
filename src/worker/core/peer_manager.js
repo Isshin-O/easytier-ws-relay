@@ -49,30 +49,21 @@ function makeInstId() {
   };
 }
 
-function makeStubPeerInfo(peerId, networkLength) {
-  return {
-    peerId,
-    version: 1,
-    lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-    instId: makeInstId(),
-    cost: 1,
-    hostname: "",
-    easytierVersion: "cf-ws-relay",
-    featureFlag: { isPublicServer: false, avoidRelayData: false, kcpInput: false, noRelayKcp: false },
-    networkLength: Number(networkLength || 24),
-    peerRouteId: randomU64String(),
-    groups: [],
-    udpStunInfo: 0,
-  };
-}
-
 export class PeerManager {
-  constructor() {
-    this.peersByGroup = new Map(); // groupKey -> Map(peerId -> ws)
-    this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo)
+  constructor(opts = {}) {
+    this.peersByGroup = new Map(); // groupKey -> Map(peerId -> ws), only peers with a live socket
+    this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo), only the live peers' own infos
     this.routeSessions = new Map(); // groupKey -> peerId -> session state
-    this.peerConnVersions = new Map(); // groupKey -> peerId -> version
+    this.networkDigestRegistry = new Map(); // networkName -> first registered secret digest
+    this.peerCenterStateByGroup = new Map(); // groupKey -> PeerCenterRpc state
+    this.lastPeerCenterClean = 0;
     this.types = null;
+
+    // Version of the server's own row in the conn bitmap. Clients only accept a row whose
+    // version is strictly larger than the one they hold, so this must never go backwards,
+    // not even across Durable Object restarts: it is persisted through onConnVersionChange.
+    this.connVersion = 0;
+    this.onConnVersionChange = opts.onConnVersionChange || null;
 
     this.allowVirtualIP = false;
     this.ipConfiguredByEnv = !!process.env.EASYTIER_IPV4_ADDR;
@@ -133,41 +124,25 @@ export class PeerManager {
     myInfo.lastUpdate = { seconds: Math.floor(Date.now() / 1000), nanos: 0 };
   }
 
-  _getPeerConnVersionMap(groupKey, create = false) {
-    const k = String(groupKey || '');
-    let m = this.peerConnVersions.get(k);
-    if (!m && create) {
-      m = new Map();
-      this.peerConnVersions.set(k, m);
-    }
-    return m;
+  // Called once with the persisted value before any socket is restored. Starting from at
+  // least the current unix time keeps us above versions handed out by older deployments
+  // that did not persist anything.
+  restoreConnVersion(stored) {
+    const floor = Math.floor(Date.now() / 1000);
+    this.connVersion = Math.max(this.connVersion, Number(stored) || 0, floor);
   }
 
-  bumpPeerConnVersion(groupKey, peerId) {
-    const m = this._getPeerConnVersionMap(groupKey, true);
-    const current = m.get(peerId) || 0;
-    const next = current + 1;
-    m.set(peerId, next);
-    return next;
-  }
-
-  getPeerConnVersion(groupKey, peerId) {
-    const m = this._getPeerConnVersionMap(groupKey, false);
-    return m ? (m.get(peerId) || 0) : 0;
-  }
-
-  bumpAllPeerConnVersions(groupKey) {
-    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
-    const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) {
-      for (const pid of infos.keys()) {
-        allPeers.add(pid);
+  bumpConnVersion() {
+    if (!this.connVersion) this.restoreConnVersion(0);
+    this.connVersion += 1;
+    if (this.onConnVersionChange) {
+      try {
+        this.onConnVersionChange(this.connVersion);
+      } catch (e) {
+        console.error('persist conn version failed:', e);
       }
     }
-    allPeers.add(MY_PEER_ID);
-    for (const pid of allPeers) {
-      this.bumpPeerConnVersion(groupKey, pid);
-    }
+    return this.connVersion;
   }
 
   setPublicServerFlag(isPublicServer) {
@@ -238,7 +213,6 @@ export class PeerManager {
         dstSessionId: null,
         weAreInitiator: false,
         peerInfoVerMap: new Map(),
-        connBitmapVerMap: new Map(),
         foreignNetVer: 0,
         lastTouch: Date.now(),
         lastConnBitmapSig: null,
@@ -266,7 +240,6 @@ export class PeerManager {
     const s = this._getSession(groupKey, peerId, true);
     if (s.dstSessionId !== theirSessionId) {
       s.peerInfoVerMap.clear();
-      s.connBitmapVerMap.clear();
       s.foreignNetVer = 0;
       s.lastConnBitmapSig = null;
     }
@@ -276,14 +249,25 @@ export class PeerManager {
     }
   }
 
-  addPeer(peerId, ws) {
+  // Returns the socket this one replaced (same peer reconnecting), if any.
+  // opts.restoring: re-registering a socket that survived hibernation; the topology the
+  // clients know has not changed, so the conn version is left alone.
+  addPeer(peerId, ws, opts = {}) {
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     const peers = this._getPeersMap(groupKey, true);
-    const isNewPeer = !peers.has(peerId);
+    const prev = peers.get(peerId);
     peers.set(peerId, ws);
-    if (isNewPeer) {
-      this.bumpAllPeerConnVersions(groupKey);
+    if (!prev) {
+      if (!opts.restoring) this.bumpConnVersion();
+    } else if (prev !== ws) {
+      // New connection means a new route session; the client resends its own info on it,
+      // possibly with a lower version if it restarted, so forget the old one.
+      const sessions = this.routeSessions.get(groupKey);
+      if (sessions) sessions.delete(peerId);
+      const infos = this._getPeerInfosMap(groupKey, false);
+      if (infos) infos.delete(peerId);
     }
+    return prev && prev !== ws ? prev : null;
   }
 
   removePeer(ws) {
@@ -291,8 +275,9 @@ export class PeerManager {
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     if (!peerId) return false;
     const peers = this._getPeersMap(groupKey, false);
-    const wasPresent = peers && peers.has(peerId);
-    if (peers) peers.delete(peerId);
+    // A late close of a replaced socket must not evict the peer's current connection.
+    if (!peers || peers.get(peerId) !== ws) return false;
+    peers.delete(peerId);
     const infos = this._getPeerInfosMap(groupKey, false);
     if (infos) infos.delete(peerId);
     const sessions = this.routeSessions.get(groupKey);
@@ -300,17 +285,15 @@ export class PeerManager {
       sessions.delete(peerId);
       if (sessions.size === 0) this.routeSessions.delete(groupKey);
     }
-    const connVers = this._getPeerConnVersionMap(groupKey, false);
-    if (connVers) connVers.delete(peerId);
+    const pc = this.peerCenterStateByGroup.get(groupKey);
+    if (pc) pc.globalPeerMap.delete(String(peerId));
 
-    if (wasPresent && peers && peers.size > 0) {
-      this.bumpAllPeerConnVersions(groupKey);
-    }
+    this.bumpConnVersion();
 
-    if (peers && peers.size === 0) {
+    if (peers.size === 0) {
       this.peersByGroup.delete(groupKey);
       this.peerInfosByGroup.delete(groupKey);
-      this.peerConnVersions.delete(groupKey);
+      this.peerCenterStateByGroup.delete(groupKey);
     }
     return true;
   }
@@ -330,13 +313,15 @@ export class PeerManager {
     return peers ? Array.from(peers.entries()) : [];
   }
 
+  // Stores a live peer's own info. Infos of peers without a socket here are never kept,
+  // otherwise a client resending its stale route table would resurrect departed peers.
+  // Returns true when the stored info changed.
   updatePeerInfo(groupKey, peerId, info) {
+    if (!this.getPeerWs(peerId, groupKey)) return false;
     const infos = this._getPeerInfosMap(groupKey, true);
-    const isNew = !infos.has(peerId);
+    const prev = infos.get(peerId);
+    if (prev && (prev.version || 0) >= (info.version || 0)) return false;
     infos.set(peerId, info);
-    if (isNew) {
-      this.bumpAllPeerConnVersions(groupKey);
-    }
 
     if (this.allowVirtualIP && !this.ipConfiguredByEnv && this.ipAutoAssigned) {
       const myInfo = this.ensureMyInfo();
@@ -368,6 +353,7 @@ export class PeerManager {
         }
       }
     }
+    return true;
   }
 
   broadcastRouteUpdate(types, groupKey, excludePeerId, opts = {}) {
@@ -404,27 +390,22 @@ export class PeerManager {
     session.mySessionId = ws.serverSessionId;
     const forceFullLocal = forceFull || !session.dstSessionId;
 
-    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
+    // Only peers holding a live socket on this server are advertised. The server cannot
+    // vouch for anything else, and advertising it is what kept departed peers alive.
+    const livePeers = this.listPeerIdsInGroup(groupKey)
+      .filter(p => p !== MY_PEER_ID)
+      .sort((a, b) => Number(a) - Number(b));
+    const relevantPeers = [MY_PEER_ID, ...livePeers];
     const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) {
-      for (const pid of infos.keys()) {
-        allPeers.add(pid);
-      }
-    }
-    allPeers.add(targetPeerId);
-    const relevantPeers = [MY_PEER_ID, ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b))];
-    const defaultNetLen = myInfo.networkLength || 24;
 
     const peerInfosItems = [];
     for (const pid of relevantPeers) {
-      let info = (pid === MY_PEER_ID)
-        ? myInfo
-        : (this._getPeerInfosMap(groupKey, false)?.get(pid));
-      if (!info) {
-        info = makeStubPeerInfo(pid, defaultNetLen);
-        this._getPeerInfosMap(groupKey, true).set(pid, info);
-      }
-      const version = info && info.version ? info.version : 1;
+      // Like EasyTier itself, never send the target its own info.
+      if (pid === targetPeerId) continue;
+      const info = (pid === MY_PEER_ID) ? myInfo : (infos && infos.get(pid));
+      // Peers that have not synced their own info yet are only listed in the bitmap.
+      if (!info) continue;
+      const version = info.version ? info.version : 1;
       const prev = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
       if (forceFullLocal || version > prev) {
         peerInfosItems.push(info);
@@ -432,50 +413,32 @@ export class PeerManager {
       }
     }
 
+    // Only the server's own row is authoritative: it lists every live peer and carries the
+    // persisted connVersion, so a newer row without a departed peer always wins on clients.
+    // The other rows say "connected to the server" with version 0, which clients store when
+    // they know nothing better but never let override a row a peer reported itself.
     let connBitmap = null;
-    if (relevantPeers.length > 0) {
-      const connVersions = this._getPeerConnVersionMap(groupKey, true);
-      const peerIdVersions = relevantPeers.map((pid) => {
-        const existing = connVersions.get(pid) || 1;
-        return { peerId: pid, version: existing };
-      });
-      const N = peerIdVersions.length;
-      const bitmapSize = Math.ceil((N * N) / 8);
-      const bitmap = new Uint8Array(bitmapSize);
-      const idxByPeerId = new Map();
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        idxByPeerId.set(peerIdVersions[i].peerId, i);
-      }
-      const setBit = (row, col) => {
-        const idx = row * N + col;
-        bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
-      };
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        setBit(i, i);
-      }
-      const serverIdx = idxByPeerId.get(MY_PEER_ID);
-      if (serverIdx !== undefined) {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          if (i === serverIdx) continue;
-          setBit(serverIdx, i);
-          setBit(i, serverIdx);
-        }
-      } else {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          for (let j = 0; j < peerIdVersions.length; j++) {
-            setBit(i, j);
-          }
-        }
-      }
-      const bitmapBuf = Buffer.from(bitmap);
-      const sig = `${peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(',')}|${bitmapBuf.toString('hex')}`;
-      const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
-      const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
-      if (sig !== session.lastConnBitmapSig) {
-        session.connBitmapVerMap.set(targetPeerId, nextConnVersion);
-        session.lastConnBitmapSig = sig;
-        connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: nextConnVersion };
-      }
+    if (!this.connVersion) this.restoreConnVersion(0);
+    const N = relevantPeers.length;
+    const bitmap = new Uint8Array(Math.ceil((N * N) / 8));
+    const setBit = (row, col) => {
+      const idx = row * N + col;
+      bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
+    };
+    const serverIdx = 0;
+    for (let i = 1; i < N; i++) {
+      setBit(serverIdx, i);
+      setBit(i, serverIdx);
+    }
+    const peerIdVersions = relevantPeers.map((pid) => ({
+      peerId: pid,
+      version: pid === MY_PEER_ID ? this.connVersion : 0,
+    }));
+    const bitmapBuf = Buffer.from(bitmap);
+    const sig = `${this.connVersion}|${relevantPeers.join(',')}`;
+    if (forceFullLocal || sig !== session.lastConnBitmapSig) {
+      session.lastConnBitmapSig = sig;
+      connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf };
     }
 
     const foreignNetworkInfos = (() => {
@@ -490,7 +453,7 @@ export class PeerManager {
             networkName: process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'dev-websocket-relay'
           },
           value: {
-            foreignPeerIds: Array.from(allPeers),
+            foreignPeerIds: livePeers,
             lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
             version,
             networkSecretDigest: Buffer.alloc(32),
@@ -547,12 +510,4 @@ export class PeerManager {
       // ignore
     }
   }
-}
-
-let peerManagerInstance = null;
-export function getPeerManager() {
-  if (!peerManagerInstance) {
-    peerManagerInstance = new PeerManager();
-  }
-  return peerManagerInstance;
 }
