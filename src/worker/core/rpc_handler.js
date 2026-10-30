@@ -311,7 +311,7 @@ export function handleRpcReq(ws, header, payload, types) {
       const hasForeignNet = !!req.foreignNetworkInfos;
       console.log(`SyncRouteInfo details: SessionID=${req.mySessionId}, Initiator=${req.isInitiator}, PeerInfosCount=${peerInfosCount}, HasConnBitmap=${hasConnBitmap}, HasForeignNet=${hasForeignNet}`);
       if (descriptor.methodIndex === 0 || descriptor.methodIndex === 1) {
-        handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types);
+        handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types, innerReqBody);
         return;
       }
       console.log(`Unhandled OspfRouteRpc methodIndex=${descriptor.methodIndex}`);
@@ -410,7 +410,51 @@ export function handleRpcResp(ws, header, payload, types) {
   }
 }
 
-function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
+function readVarint(buf, pos) {
+  let n = 0;
+  let mul = 1;
+  let b;
+  do {
+    b = buf[pos++];
+    n += (b & 0x7f) * mul;
+    mul *= 128;
+  } while (b & 0x80);
+  return [n, pos];
+}
+
+// Calls onField(fieldNumber, start, end) for each length-delimited field in buf[start, end).
+function walkLenFields(buf, start, end, onField) {
+  let pos = start;
+  while (pos < end) {
+    let key;
+    [key, pos] = readVarint(buf, pos);
+    const wireType = key & 7;
+    if (wireType === 0) [, pos] = readVarint(buf, pos);
+    else if (wireType === 1) pos += 8;
+    else if (wireType === 5) pos += 4;
+    else if (wireType === 2) {
+      let len;
+      [len, pos] = readVarint(buf, pos);
+      onField(Math.floor(key / 8), pos, pos + len);
+      pos += len;
+    } else throw new Error(`unsupported wire type ${wireType}`);
+  }
+}
+
+// Raw bytes of each RoutePeerInfo in SyncRouteInfoRequest.peer_infos (field 4, items = 1), in
+// wire order, so relayed infos keep the fields our proto does not know.
+export function rawPeerInfoItems(reqBytes) {
+  const items = [];
+  walkLenFields(reqBytes, 0, reqBytes.length, (field, s, e) => {
+    if (field !== 4) return;
+    walkLenFields(reqBytes, s, e, (f, s2, e2) => {
+      if (f === 1) items.push(Buffer.from(reqBytes.subarray(s2, e2)));
+    });
+  });
+  return items;
+}
+
+function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, reqBytes) {
   const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
   const pm = ws.peerManager;
   if (!ws.peerId || fromPeerId !== ws.peerId) {
@@ -427,16 +471,23 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
   }
   pm.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
-  // Only the sender's own info is trusted. Clients also resend whatever is left in their
-  // route table, including peers that already left this server; storing those is what
-  // brought departed peers back as ghosts.
-  let selfInfoChanged = false;
-  if (syncReq.peerInfos && syncReq.peerInfos.items) {
-    for (const info of syncReq.peerInfos.items) {
-      if (info.peerId === fromPeerId && pm.updatePeerInfo(groupKey, fromPeerId, info)) {
-        selfInfoChanged = true;
-      }
-    }
+  // Everything the client knows is stored, including peers behind it, so peers that are not
+  // connected to the server still reach everyone. Stale entries cannot come back as ghosts:
+  // only peers reachable through live links are advertised (PeerManager.reachablePeers).
+  let routeChanged = false;
+  const items = (syncReq.peerInfos && syncReq.peerInfos.items) || [];
+  let raws = [];
+  try {
+    raws = rawPeerInfoItems(reqBytes);
+  } catch (e) {
+    console.warn(`Extract raw peer infos from ${fromPeerId} failed: ${e.message}`);
+  }
+  if (raws.length !== items.length) raws = [];
+  items.forEach((info, i) => {
+    if (pm.updatePeerInfo(groupKey, info.peerId, info, raws[i] || null)) routeChanged = true;
+  });
+  if (syncReq.connBitmap && pm.updateConnBitmap(groupKey, syncReq.connBitmap)) {
+    routeChanged = true;
   }
 
   const respPayload = {
@@ -466,7 +517,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     console.error(`Failed to push route update to peer ${fromPeerId}:`, e);
   }
 
-  if (selfInfoChanged) {
+  if (routeChanged) {
     try {
       pm.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: false });
       console.log(`Successfully broadcast route update for group ${groupKey}`);

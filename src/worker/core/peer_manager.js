@@ -5,6 +5,23 @@ import { wrapPacket, randomU64String } from './crypto.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
+function encodeVarint(n) {
+  const out = [];
+  while (n > 0x7f) {
+    out.push((n & 0x7f) | 0x80);
+    n = Math.floor(n / 128);
+  }
+  out.push(n);
+  return Buffer.from(out);
+}
+
+// SyncRouteInfoRequest.peer_infos (field 4) = RoutePeerInfos { repeated bytes items = 1 },
+// written by hand so relayed infos keep fields our proto does not know.
+function encodePeerInfosField(raws) {
+  const inner = Buffer.concat(raws.flatMap((r) => [Buffer.from([0x0a]), encodeVarint(r.length), Buffer.from(r)]));
+  return Buffer.concat([Buffer.from([0x22]), encodeVarint(inner.length), inner]);
+}
+
 function parseIpv4ToU32Be(ip) {
   const parts = String(ip).trim().split('.').map(x => Number(x));
   if (parts.length !== 4 || parts.some(x => !Number.isInteger(x) || x < 0 || x > 255)) {
@@ -52,7 +69,13 @@ function makeInstId() {
 export class PeerManager {
   constructor(opts = {}) {
     this.peersByGroup = new Map(); // groupKey -> Map(peerId -> ws), only peers with a live socket
-    this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo), only the live peers' own infos
+    // The route database relayed between peers, like an EasyTier node keeps it. Entries of
+    // peers the server cannot reach are kept but never advertised, see reachablePeers.
+    // ponytail: never pruned while the room has sockets; memory grows with every peer id seen
+    // until the room empties or the DO is evicted. If that matters, prune unreachable entries
+    // but make the relaying peers resync (new session id), or pruned infos never come back.
+    this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> { info, raw })
+    this.connRowsByGroup = new Map(); // groupKey -> Map(peerId -> { version, peers }), rows the peers reported themselves
     this.routeSessions = new Map(); // groupKey -> peerId -> session state
     this.networkDigestRegistry = new Map(); // networkName -> first registered secret digest
     this.peerCenterStateByGroup = new Map(); // groupKey -> PeerCenterRpc state
@@ -194,6 +217,16 @@ export class PeerManager {
     return m;
   }
 
+  _getConnRowsMap(groupKey, create = false) {
+    const k = String(groupKey || '');
+    let m = this.connRowsByGroup.get(k);
+    if (!m && create) {
+      m = new Map();
+      this.connRowsByGroup.set(k, m);
+    }
+    return m;
+  }
+
   _getSession(groupKey, peerId, create = false) {
     const now = Date.now();
     if (now - this.lastSessionCleanup > Math.max(30_000, Math.min(this.sessionTtlMs / 2, 120_000))) {
@@ -278,8 +311,9 @@ export class PeerManager {
     // A late close of a replaced socket must not evict the peer's current connection.
     if (!peers || peers.get(peerId) !== ws) return false;
     peers.delete(peerId);
-    const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) infos.delete(peerId);
+    // Its info and conn row stay: it may still be reachable through another peer, and the
+    // others would not resend what they believe we already have. If it is gone for good it
+    // is simply no longer reachable, so it is not advertised.
     const sessions = this.routeSessions.get(groupKey);
     if (sessions) {
       sessions.delete(peerId);
@@ -293,6 +327,7 @@ export class PeerManager {
     if (peers.size === 0) {
       this.peersByGroup.delete(groupKey);
       this.peerInfosByGroup.delete(groupKey);
+      this.connRowsByGroup.delete(groupKey);
       this.peerCenterStateByGroup.delete(groupKey);
     }
     return true;
@@ -313,15 +348,16 @@ export class PeerManager {
     return peers ? Array.from(peers.entries()) : [];
   }
 
-  // Stores a live peer's own info. Infos of peers without a socket here are never kept,
-  // otherwise a client resending its stale route table would resurrect departed peers.
-  // Returns true when the stored info changed.
-  updatePeerInfo(groupKey, peerId, info) {
-    if (!this.getPeerWs(peerId, groupKey)) return false;
+  // Stores a peer info relayed by any peer, newest version wins, like EasyTier does. Storing
+  // stale infos is harmless: only reachable peers are advertised (see reachablePeers).
+  // raw: the info's original bytes, relayed as is. Returns true when the stored info changed.
+  updatePeerInfo(groupKey, peerId, info, raw = null) {
+    // Our own id: nobody else may speak for us.
+    if (peerId === MY_PEER_ID || !info.version) return false;
     const infos = this._getPeerInfosMap(groupKey, true);
     const prev = infos.get(peerId);
-    if (prev && (prev.version || 0) >= (info.version || 0)) return false;
-    infos.set(peerId, info);
+    if (prev && (prev.info.version || 0) >= info.version) return false;
+    infos.set(peerId, { info, raw });
 
     if (this.allowVirtualIP && !this.ipConfiguredByEnv && this.ipAutoAssigned) {
       const myInfo = this.ensureMyInfo();
@@ -354,6 +390,66 @@ export class PeerManager {
       }
     }
     return true;
+  }
+
+  // Stores the rows of a client's conn bitmap: row i lists the peers peer_ids[i] is directly
+  // connected to, versioned by that peer. Returns true when any stored row changed.
+  updateConnBitmap(groupKey, connBitmap) {
+    const ids = (connBitmap && connBitmap.peerIds) || [];
+    const bits = connBitmap && connBitmap.bitmap ? connBitmap.bitmap : [];
+    const N = ids.length;
+    const rows = this._getConnRowsMap(groupKey, true);
+    let changed = false;
+    for (let i = 0; i < N; i++) {
+      const { peerId, version } = ids[i];
+      if (peerId === MY_PEER_ID || !version) continue;
+      const prev = rows.get(peerId);
+      if (prev && prev.version >= version) continue;
+      const peers = [];
+      for (let j = 0; j < N; j++) {
+        const idx = i * N + j;
+        if (j !== i && (bits[idx >> 3] & (1 << (idx & 7)))) peers.push(ids[j].peerId);
+      }
+      rows.set(peerId, { version, peers });
+      changed = true;
+    }
+    return changed;
+  }
+
+  // Breadth-first walk from the server: its live sockets, then whatever the reached peers
+  // report as their own direct connections. A departed peer has no live link pointing to
+  // it, so it is not reachable however often clients resend its old info.
+  // Returns Map(peerId -> live peer to hand its packets to), shortest hop count first.
+  // ponytail: recomputed per call, fine for rooms of tens of peers; cache per conn change if not.
+  _firstHops(groupKey) {
+    const rows = this._getConnRowsMap(groupKey, false);
+    const live = this.listPeerIdsInGroup(groupKey).filter(p => p !== MY_PEER_ID);
+    const hops = new Map(live.map(p => [p, p]));
+    const queue = [...live];
+    while (queue.length > 0) {
+      const pid = queue.shift();
+      const row = rows && rows.get(pid);
+      if (!row) continue;
+      for (const q of row.peers) {
+        if (q !== MY_PEER_ID && !hops.has(q)) {
+          hops.set(q, hops.get(pid));
+          queue.push(q);
+        }
+      }
+    }
+    return hops;
+  }
+
+  // Server first, then every reachable peer.
+  reachablePeers(groupKey) {
+    const others = Array.from(this._firstHops(groupKey).keys()).sort((a, b) => Number(a) - Number(b));
+    return [MY_PEER_ID, ...others];
+  }
+
+  // Socket to forward a packet for peerId through: its own, or the live peer it sits behind.
+  nextHopWs(peerId, groupKey) {
+    const hop = this._firstHops(groupKey).get(peerId);
+    return hop === undefined ? undefined : this.getPeerWs(hop, groupKey);
   }
 
   broadcastRouteUpdate(types, groupKey, excludePeerId, opts = {}) {
@@ -390,52 +486,61 @@ export class PeerManager {
     session.mySessionId = ws.serverSessionId;
     const forceFullLocal = forceFull || !session.dstSessionId;
 
-    // Only peers holding a live socket on this server are advertised. The server cannot
-    // vouch for anything else, and advertising it is what kept departed peers alive.
-    const livePeers = this.listPeerIdsInGroup(groupKey)
-      .filter(p => p !== MY_PEER_ID)
-      .sort((a, b) => Number(a) - Number(b));
-    const relevantPeers = [MY_PEER_ID, ...livePeers];
+    // Only peers reachable from the server through live links are advertised, so peers
+    // behind other peers show up while departed ones cannot be resurrected.
+    const livePeers = this.listPeerIdsInGroup(groupKey).filter(p => p !== MY_PEER_ID);
+    const relevantPeers = this.reachablePeers(groupKey);
     const infos = this._getPeerInfosMap(groupKey, false);
+    const rows = this._getConnRowsMap(groupKey, false);
+    const t = this.types;
+    if (!t) {
+      throw new Error('PeerManager types not set');
+    }
 
-    const peerInfosItems = [];
+    const rawPeerInfos = [];
     for (const pid of relevantPeers) {
       // Like EasyTier itself, never send the target its own info.
       if (pid === targetPeerId) continue;
-      const info = (pid === MY_PEER_ID) ? myInfo : (infos && infos.get(pid));
-      // Peers that have not synced their own info yet are only listed in the bitmap.
-      if (!info) continue;
-      const version = info.version ? info.version : 1;
+      const entry = (pid === MY_PEER_ID) ? { info: myInfo, raw: null } : (infos && infos.get(pid));
+      // Peers whose info has not arrived yet are only listed in the bitmap.
+      if (!entry) continue;
+      const version = entry.info.version ? entry.info.version : 1;
       const prev = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
       if (forceFullLocal || version > prev) {
-        peerInfosItems.push(info);
+        rawPeerInfos.push(entry.raw || t.RoutePeerInfo.encode(entry.info).finish());
         session.peerInfoVerMap.set(pid, version);
       }
     }
 
-    // Only the server's own row is authoritative: it lists every live peer and carries the
-    // persisted connVersion, so a newer row without a departed peer always wins on clients.
-    // The other rows say "connected to the server" with version 0, which clients store when
-    // they know nothing better but never let override a row a peer reported itself.
+    // The server's own row lists its live sockets and carries the persisted connVersion, so
+    // a newer row without a departed peer always wins on clients. Every other row is relayed
+    // with the version its peer gave it. A live peer whose row has not arrived yet gets a
+    // version 0 "connected to the server" row, which clients only keep while they know nothing
+    // better.
     let connBitmap = null;
     if (!this.connVersion) this.restoreConnVersion(0);
     const N = relevantPeers.length;
+    const index = new Map(relevantPeers.map((pid, i) => [pid, i]));
     const bitmap = new Uint8Array(Math.ceil((N * N) / 8));
     const setBit = (row, col) => {
       const idx = row * N + col;
       bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
     };
-    const serverIdx = 0;
-    for (let i = 1; i < N; i++) {
-      setBit(serverIdx, i);
-      setBit(i, serverIdx);
-    }
-    const peerIdVersions = relevantPeers.map((pid) => ({
-      peerId: pid,
-      version: pid === MY_PEER_ID ? this.connVersion : 0,
-    }));
+    const peerIdVersions = relevantPeers.map((pid, i) => {
+      if (pid === MY_PEER_ID) {
+        for (const p of livePeers) setBit(i, index.get(p));
+        return { peerId: pid, version: this.connVersion };
+      }
+      const row = rows && rows.get(pid);
+      if (row) {
+        for (const p of row.peers) if (index.has(p)) setBit(i, index.get(p));
+        return { peerId: pid, version: row.version };
+      }
+      if (livePeers.includes(pid)) setBit(i, 0);
+      return { peerId: pid, version: 0 };
+    });
     const bitmapBuf = Buffer.from(bitmap);
-    const sig = `${this.connVersion}|${relevantPeers.join(',')}`;
+    const sig = `${this.connVersion}|${peerIdVersions.map(x => `${x.peerId}:${x.version}`).join(',')}`;
     if (forceFullLocal || sig !== session.lastConnBitmapSig) {
       session.lastConnBitmapSig = sig;
       connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf };
@@ -463,25 +568,18 @@ export class PeerManager {
       };
     })();
 
-    const t = this.types;
-    if (!t) {
-      throw new Error('PeerManager types not set');
-    }
-    const rawPeerInfos = peerInfosItems.length > 0
-      ? peerInfosItems.map(info => t.RoutePeerInfo.encode(info).finish())
-      : null;
-
     const reqPayload = {
       myPeerId: MY_PEER_ID,
       mySessionId: ws.serverSessionId,
       isInitiator: !!ws.weAreInitiator,
-      peerInfos: peerInfosItems.length > 0 ? { items: peerInfosItems } : null,
-      rawPeerInfos: rawPeerInfos,
       connBitmap: connBitmap,
       foreignNetworkInfos: foreignNetworkInfos
     };
 
-    const reqBytes = t.SyncRouteInfoRequest.encode(reqPayload).finish();
+    let reqBytes = t.SyncRouteInfoRequest.encode(reqPayload).finish();
+    if (rawPeerInfos.length > 0) {
+      reqBytes = Buffer.concat([Buffer.from(reqBytes), encodePeerInfosField(rawPeerInfos)]);
+    }
     const rpcRequestPayload = { request: reqBytes, timeoutMs: 5000 };
     const rpcRequestBytes = t.RpcRequest.encode(rpcRequestPayload).finish();
 

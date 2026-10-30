@@ -105,9 +105,12 @@ export function handlePing(ws, header, payload) {
 export function handleForwarding(sourceWs, header, fullMessage, types) {
   const targetPeerId = header.toPeerId;
   const pm = sourceWs.peerManager;
-  const targetWs = pm.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
+  const groupKey = sourceWs && sourceWs.groupKey;
+  // Peers behind another peer are reached through that peer, which relays like any node.
+  const targetWs = pm.getPeerWs(targetPeerId, groupKey) || pm.nextHopWs(targetPeerId, groupKey);
 
-  if (targetWs && targetWs.readyState === WS_OPEN) {
+  // Never bounce a packet back where it came from.
+  if (targetWs && targetWs !== sourceWs && targetWs.readyState === WS_OPEN) {
     const srcGroup = sourceWs && sourceWs.groupKey;
     const dstGroup = targetWs && targetWs.groupKey;
     if (srcGroup && dstGroup && srcGroup !== dstGroup) {
